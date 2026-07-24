@@ -61,9 +61,35 @@ std::string UnprotectMemory(std::vector<BYTE> protectedData) {
 }
 
 /**
+ * @brief Parses the ServerURL from the Docker JSON payload.
+ * 
+ * Currently uses a rudimentary string search ("Caveman impl") to map the URL. 
+ * TODO: Implement a robust JSON parser for better reliability.
+ * 
+ * @param jsonPayload The raw JSON string provided by Docker on STDIN.
+ * @return std::string The extracted ServerURL, or "default" if not found.
+ */
+std::string ParseServerUrl(const std::string& jsonPayload) {
+    std::string urlMarker = "\"ServerURL\":";
+    size_t pos = jsonPayload.find(urlMarker);
+    std::string url = "default";
+    
+    if (pos != std::string::npos) {
+        size_t start = jsonPayload.find("\"", pos + urlMarker.length()) + 1;
+        size_t end = jsonPayload.find("\"", start);
+        url = jsonPayload.substr(start, end - start);
+    }
+    return url;
+}
+
+/**
  * @brief Runs the persistent named pipe server to hold credentials in RAM.
  * 
- * Loops indefinitely, processing STORE, GET, and ERASE commands from client instances.
+ * Loops indefinitely, processing commands from client instances.
+ * Supported pipe commands:
+ * - STORE <url>|<json_payload>
+ * - GET <url>
+ * - ERASE <url>
  */
 void RunDaemon() {
     std::map<std::string, std::vector<BYTE>> volatileVault;
@@ -95,7 +121,6 @@ void RunDaemon() {
                 std::string request(buffer);
                 
                 if (request.rfind("STORE ", 0) == 0) {
-                    // Format: "STORE <url>|<json_payload>"
                     size_t split = request.find('|');
                     if (split != std::string::npos) {
                         std::string url = request.substr(6, split - 6);
@@ -104,7 +129,6 @@ void RunDaemon() {
                     }
                 } 
                 else if (request.rfind("GET ", 0) == 0) {
-                    // Format: "GET <url>"
                     std::string url = request.substr(4);
                     url.erase(url.find_last_not_of(" \n\r\t") + 1); 
                     
@@ -188,16 +212,7 @@ int main(int argc, char* argv[]) {
     input.erase(input.find_last_not_of(" \n\r\t") + 1);
 
     if (command == "store") {
-        // Caveman impl; looks for ServerURL in the JSON to map it
-        // TODO: Better parser
-        std::string urlMarker = "\"ServerURL\":";
-        size_t pos = input.find(urlMarker);
-        std::string url = "default";
-        if (pos != std::string::npos) {
-            size_t start = input.find("\"", pos + urlMarker.length()) + 1;
-            size_t end = input.find("\"", start);
-            url = input.substr(start, end - start);
-        }
+        std::string url = ParseServerUrl(input);
         SendToDaemon("STORE " + url + "|" + input);
     } 
     else if (command == "get") {
@@ -205,8 +220,7 @@ int main(int argc, char* argv[]) {
         if (!response.empty()) {
             std::cout << response;
         } else {
-            // No credential, write to stderr to keep docker frm throwing a fit
-            std::cerr << "credentials not found in cache" << std::endl;
+            std::cout << "credentials not found\n";
             return 1;
         }
     } 
@@ -220,3 +234,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
