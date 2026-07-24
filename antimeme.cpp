@@ -4,7 +4,7 @@
  * 
  * This tool securely caches Docker credentials exclusively in RAM using 
  * CryptProtectMemory. It implements a Named Pipe daemon to hold the state 
- * and handles standard Docker credential helper commands (get, store, erase).
+ * and handles standard Docker credential helper commands (get, store, erase, list).
  */
 
 #include <windows.h>
@@ -61,25 +61,30 @@ std::string UnprotectMemory(std::vector<BYTE> protectedData) {
 }
 
 /**
- * @brief Parses the ServerURL from the Docker JSON payload.
+ * @brief Extracts a specific string field value from a JSON payload.
  * 
- * Currently uses a rudimentary string search ("Caveman impl") to map the URL. 
+ * Uses rudimentary string searching. 
  * TODO: Implement a robust JSON parser for better reliability.
  * 
- * @param jsonPayload The raw JSON string provided by Docker on STDIN.
- * @return std::string The extracted ServerURL, or "default" if not found.
+ * @param jsonPayload The raw JSON string.
+ * @param field The key to search for (e.g., "ServerURL" or "Username").
+ * @return std::string The extracted value, or empty string if not found.
  */
-std::string ParseServerUrl(const std::string& jsonPayload) {
-    std::string urlMarker = "\"ServerURL\":";
-    size_t pos = jsonPayload.find(urlMarker);
-    std::string url = "default";
+std::string ExtractJsonField(const std::string& jsonPayload, const std::string& field) {
+    std::string marker = "\"" + field + "\":";
+    size_t pos = jsonPayload.find(marker);
     
     if (pos != std::string::npos) {
-        size_t start = jsonPayload.find("\"", pos + urlMarker.length()) + 1;
-        size_t end = jsonPayload.find("\"", start);
-        url = jsonPayload.substr(start, end - start);
+        size_t start = jsonPayload.find("\"", pos + marker.length());
+        if (start != std::string::npos) {
+            start++; 
+            size_t end = jsonPayload.find("\"", start);
+            if (end != std::string::npos) {
+                return jsonPayload.substr(start, end - start);
+            }
+        }
     }
-    return url;
+    return "";
 }
 
 /**
@@ -90,6 +95,7 @@ std::string ParseServerUrl(const std::string& jsonPayload) {
  * - STORE <url>|<json_payload>
  * - GET <url>
  * - ERASE <url>
+ * - LIST
  */
 void RunDaemon() {
     std::map<std::string, std::vector<BYTE>> volatileVault;
@@ -145,6 +151,24 @@ void RunDaemon() {
                     url.erase(url.find_last_not_of(" \n\r\t") + 1);
                     volatileVault.erase(url);
                 }
+                else if (request == "LIST") {
+                    std::string jsonResponse = "{";
+                    bool first = true;
+                    
+                    for (auto const& [url, encryptedPayload] : volatileVault) {
+                        std::string plaintext = UnprotectMemory(encryptedPayload);
+                        std::string username = ExtractJsonField(plaintext, "Username");
+                        SecureZeroMemory(&plaintext[0], plaintext.length());
+                        
+                        if (!first) jsonResponse += ",";
+                        jsonResponse += "\"" + url + "\":\"" + username + "\"";
+                        first = false;
+                    }
+                    jsonResponse += "}\n";
+                    
+                    DWORD bytesWritten;
+                    WriteFile(hPipe, jsonResponse.c_str(), (DWORD)jsonResponse.length(), &bytesWritten, NULL);
+                }
             }
         }
         DisconnectNamedPipe(hPipe);
@@ -155,23 +179,38 @@ void RunDaemon() {
 /**
  * @brief Sends a command to the background daemon via Named Pipe.
  * 
+ * Safely queues connection attempts to handle concurrent blasts from BuildKit.
+ * 
  * @param message The command string to send.
  * @return std::string The response from the daemon, if any.
  */
 std::string SendToDaemon(const std::string& message) {
-    HANDLE hPipe = CreateFileA(
-        PIPE_NAME,
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL
-    );
+    HANDLE hPipe;
+    while (true) {
+        hPipe = CreateFileA(
+            PIPE_NAME,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL
+        );
 
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "Daemon not running. Start it with: docker-credential-antimeme daemon" << std::endl;
-        exit(1);
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            break;
+        }
+
+        if (GetLastError() != ERROR_PIPE_BUSY) {
+            std::cerr << "Daemon not running." << std::endl;
+            exit(1);
+        }
+
+        // Wait up to 5 seconds for the pipe to become available
+        if (!WaitNamedPipeA(PIPE_NAME, 5000)) {
+            std::cerr << "Pipe timeout." << std::endl;
+            exit(1);
+        }
     }
 
     DWORD bytesWritten;
@@ -179,9 +218,9 @@ std::string SendToDaemon(const std::string& message) {
 
     char buffer[BUFFER_SIZE] = { 0 };
     DWORD bytesRead;
-    if (ReadFile(hPipe, buffer, BUFFER_SIZE - 1, &bytesRead, NULL)) {
+    if (ReadFile(hPipe, buffer, BUFFER_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
         CloseHandle(hPipe);
-        return std::string(buffer);
+        return std::string(buffer, bytesRead);
     }
 
     CloseHandle(hPipe);
@@ -193,7 +232,7 @@ std::string SendToDaemon(const std::string& message) {
  */
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: docker-credential-antimeme <daemon|store|get|erase>" << std::endl;
+        std::cerr << "Usage: docker-credential-antimeme <daemon|store|get|erase|list>" << std::endl;
         return 1;
     }
 
@@ -205,14 +244,22 @@ int main(int argc, char* argv[]) {
     }
 
     std::string input;
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        input += line;
+    
+    // Crucial: Only attempt to read STDIN for commands that actually expect it.
+    // Reading STDIN on 'list' will cause a permanent hang.
+    if (command == "store" || command == "get" || command == "erase") {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            input += line;
+        }
+        if (!input.empty()) {
+            input.erase(input.find_last_not_of(" \n\r\t") + 1);
+        }
     }
-    input.erase(input.find_last_not_of(" \n\r\t") + 1);
 
     if (command == "store") {
-        std::string url = ParseServerUrl(input);
+        std::string url = ExtractJsonField(input, "ServerURL");
+        if (url.empty()) url = "default";
         SendToDaemon("STORE " + url + "|" + input);
     } 
     else if (command == "get") {
@@ -220,13 +267,20 @@ int main(int argc, char* argv[]) {
         if (!response.empty()) {
             std::cout << response;
         } else {
-            std::cout << "credentials not found\n";
-            return 1;
+            // Exploit: BuildKit violently aborts on standard error exits.
+            // Returning empty auth forces an immediate, native anonymous fallback.
+            std::cout << "{\"Username\":\"\",\"Secret\":\"\"}\n";
         }
+        return 0; 
     } 
     else if (command == "erase") {
         SendToDaemon("ERASE " + input);
     } 
+    else if (command == "list") {
+        std::string response = SendToDaemon("LIST");
+        std::cout << response;
+        return 0;
+    }
     else {
         std::cerr << "Unknown command: " << command << std::endl;
         return 1;
@@ -234,4 +288,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
